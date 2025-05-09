@@ -2,7 +2,7 @@
 
 **Effective Date:** 5/9/25
 
-This Privacy Policy explains how Spotify Stats Bot ("the Service") collects, uses, and protects your information.
+This Privacy Policy explains how the Hershey Experience, Hershey 🎷, a Spotify Stats Bot ("the Service") collects, uses, and protects your information.
 
 ## 1. Information We Collect
 - **Spotify Data:** When you use the bot, we collect your Spotify listening history and basic profile information (such as your Spotify user ID) to provide statistics and analytics.
