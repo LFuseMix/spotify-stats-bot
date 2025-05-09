@@ -1,0 +1,26 @@
+{
+  "name": "spotify-stats-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@discordjs/builders": "^1.10.1",
+    "@discordjs/rest": "^2.4.3",
+    "@google/generative-ai": "^0.24.0",
+    "adm-zip": "^0.5.16",
+    "better-sqlite3": "^11.9.1",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.5.0",
+    "express": "^5.1.0",
+    "ngrok": "^5.0.0-beta.2",
+    "node-fetch": "^2.7.0",
+    "spotify-web-api-node": "^5.0.2"
+  }
+}
