@@ -2,7 +2,7 @@
 
 **Effective Date:** 5/9/25
 
-Welcome to the Spotify Stats Bot! By using this Discord bot ("the Service"), you agree to the following terms:
+Welcome to the Hershey Experience, Hershey 🎷, a Spotify Stats Bot! By using this Discord bot ("the Service"), you agree to the following terms:
 
 ## 1. Acceptance of Terms
 By using the Spotify Stats Bot, you agree to comply with and be bound by these Terms of Service. If you do not agree, please do not use the Service.
