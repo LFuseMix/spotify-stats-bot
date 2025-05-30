@@ -1,6 +1,7 @@
 // commands/config_color.js
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const { getUser, updateUserColor } = require('../utils/database');
+const { generateProgressBar } = require('../utils/progressBar');
 const config = require('../config.json');
 
 // Map color names to hex codes
@@ -52,10 +53,18 @@ module.exports = {
             const updated = updateUserColor(discordId, hexColor);
 
             if (updated) {
+                // Generate a sample progress bar with the new color
+                const sampleProgressBar = generateProgressBar(75, 100, hexColor);
+                
                  const embed = new EmbedBuilder()
                     .setColor(hexColor) // Use the new color for confirmation
                     .setTitle('🎨 Embed Color Updated!')
                     .setDescription(`Your embed color has been set to **${chosenColorName}** (${hexColor}).`)
+                    .addFields({
+                        name: '📊 Progress Bar Preview',
+                        value: `Sample Song Name by Artist Name\n4:32 • 127 plays ${sampleProgressBar}`,
+                        inline: false
+                    })
                     .setTimestamp();
 
                 await interaction.reply({ embeds: [embed], ephemeral: true });

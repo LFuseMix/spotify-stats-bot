@@ -1,8 +1,8 @@
 # Privacy Policy
 
-**Effective Date:** 5/9/25
+**Effective Date:** 5/29/2025
 
-This Privacy Policy explains how Spotify Stats Bot ("the Service") collects, uses, and protects your information.
+This Privacy Policy explains how Hershey 🎷 (Spotify Stats Bot) ("the Service") collects, uses, and protects your information.
 
 ## 1. Information We Collect
 - **Spotify Data:** When you use the bot, we collect your Spotify listening history and basic profile information (such as your Spotify user ID) to provide statistics and analytics.
@@ -29,8 +29,8 @@ This Privacy Policy explains how Spotify Stats Bot ("the Service") collects, use
 - We may update this Privacy Policy from time to time. Continued use of the Service means you accept the new policy.
 
 ## 7. Contact
-For privacy questions or data requests, contact [ntatschool@outlook.com](mailto:ntatschool@outlook.com) or join our [support server](https://discord.com/invite/kB5D658vbT).
+For privacy questions or data requests, contact [ntatschool@outlook.com](mailto:ntatschool@outlook.com) or join our [support server](https://discord.gg/GJKQJjcsGA).
 
 ---
 
-© 2024 LFuse. All rights reserved. 
+© 2025 LFuse. All rights reserved. 

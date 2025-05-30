@@ -3,6 +3,8 @@ const express = require('express');
 const { getSpotifyApi } = require('../utils/spotify'); // Only need the base api for auth code grant
 const { linkSpotifyAccount, addUser } = require('../utils/database');
 const querystring = require('node:querystring');
+const SpotifyWebApi = require('spotify-web-api-node');
+const Logger = require('../utils/logger'); // Add our new logger
 
 const stateStore = new Map(); // Simple in-memory store for state parameter (Discord ID)
 
@@ -20,75 +22,70 @@ function startWebServer(client, port) { // Pass discord client if needed later
 
     // Spotify callback endpoint
     app.get('/callback', async (req, res) => {
-        const code = req.query.code || null;
-        const state = req.query.state || null;
-        const error = req.query.error || null;
+        const { code, state, error } = req.query;
+        Logger.network('callback', 'received', 'Received callback', `Code: ${!!code}, State: ${state}, Error: ${error || 'none'}`);
 
-        console.log('[Callback] Received callback:', { code: !!code, state, error });
-
-        if (error || !state || !stateStore.has(state)) {
-            console.error('[Callback Error] State mismatch or error:', error || 'State mismatch/missing');
-            return res.status(400).send(`
-                <html><body>
-                    <h2>Authentication Failed</h2>
-                    <p>${error ? `Spotify Error: ${error}` : 'Invalid state parameter. Please try the /connect command again.'}</p>
-                </body></html>
-            `);
+        if (error || !state || !code) {
+            Logger.error('callback', 'State mismatch or error', error || 'State mismatch/missing');
+            return res.status(400).send('Authorization failed or invalid request.');
         }
 
-        const discordId = stateStore.get(state);
-        stateStore.delete(state); // Clean up state
+        const storedState = stateStore.get(state);
+        if (!storedState) {
+            return res.status(400).send('Invalid or expired state parameter.');
+        }
 
-        const spotifyApiInstance = getSpotifyApi(); // Use the singleton
+        stateStore.delete(state); // Clean up used state
+        const discordId = storedState.discordId;
 
         try {
-            const data = await spotifyApiInstance.authorizationCodeGrant(code);
-            const { access_token, refresh_token, expires_in } = data.body;
+            // Use the main SpotifyApi instance that has the correct redirect URI
+            const spotifyApi = getSpotifyApi();
 
-            console.log('[Callback] Tokens received for potential Discord ID:', discordId);
+            const data = await spotifyApi.authorizationCodeGrant(code);
+            Logger.success('callback', 'Tokens received for potential Discord ID', discordId);
 
-            // Use the access token to get the Spotify user ID
-            spotifyApiInstance.setAccessToken(access_token);
-            const me = await spotifyApiInstance.getMe();
+            const accessToken = data.body['access_token'];
+            const refreshToken = data.body['refresh_token'];
+            const expiresIn = data.body['expires_in'];
+
+            spotifyApi.setAccessToken(accessToken);
+            const me = await spotifyApi.getMe();
             const spotifyId = me.body.id;
             const spotifyDisplayName = me.body.display_name || spotifyId;
 
-            console.log(`[Callback] Linking Discord ID ${discordId} to Spotify ID ${spotifyId} (${spotifyDisplayName})`);
+            Logger.success('callback', `Linking Discord ID ${discordId} to Spotify ID ${spotifyId}`, `Display Name: ${spotifyDisplayName}`);
 
-             // Ensure user exists in DB before linking
-             addUser(discordId); // Add if not exists, ignore if exists
+            // Save to database
+            const result = linkSpotifyAccount(discordId, spotifyId, accessToken, refreshToken, expiresIn);
+            
+            if (result.success) {
+                res.send(`
+                    <html>
+                        <head><title>Spotify Connected</title></head>
+                        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                            <h1 style="color: #1DB954;">✅ Success!</h1>
+                            <p>Your Spotify account has been successfully linked!</p>
+                            <p><strong>Spotify Account:</strong> ${spotifyDisplayName}</p>
+                            <p>You can now close this window and return to Discord.</p>
+                        </body>
+                    </html>
+                `);
 
-            // Store tokens and Spotify ID in the database
-            linkSpotifyAccount(discordId, spotifyId, access_token, refresh_token, expires_in);
-
-             // Inform the user via the web page (Discord interaction is handled separately)
-             res.send(`
-                 <html><body>
-                     <h2>Authentication Successful!</h2>
-                     <p>Successfully linked your Discord account (${discordId}) to Spotify account: <strong>${spotifyDisplayName}</strong>.</p>
-                     <p>You can now close this window and use the bot commands in Discord.</p>
-                 </body></html>
-             `);
-
-             // Optional: Send a DM to the user via the bot (requires fetching the user)
-             try {
-                  const discordUser = await client.users.fetch(discordId);
-                  if(discordUser) {
-                      await discordUser.send(`✅ Successfully connected your Spotify account (${spotifyDisplayName})! You can now use commands like \`/profile\` and \`/top-songs\`.`);
-                  }
-             } catch (dmError) {
-                  console.warn(`[Callback] Could not send DM to user ${discordId}:`, dmError);
-             }
+                // Try to DM the user
+                try {
+                    const user = await client.users.fetch(discordId);
+                    await user.send('🎵 Your Spotify account has been successfully connected! You can now use music commands.');
+                } catch (dmError) {
+                    Logger.warn('callback', `Could not send DM to user ${discordId}`, dmError.message);
+                }
+            } else {
+                res.status(500).send('Database error occurred while linking your account.');
+            }
 
         } catch (err) {
-            console.error('[Callback Auth Grant Error] Could not exchange code for tokens or get user profile:', err.body || err.message);
-             res.status(500).send(`
-                 <html><body>
-                     <h2>Authentication Failed</h2>
-                     <p>An error occurred while communicating with Spotify. Please try again later.</p>
-                     <pre>${err.message}</pre>
-                 </body></html>
-             `);
+            Logger.error('callback', 'Could not exchange code for tokens or get user profile', err.body?.error_description || err.message);
+            res.status(500).send('Failed to authenticate with Spotify.');
         }
     });
 
@@ -101,14 +98,27 @@ function startWebServer(client, port) { // Pass discord client if needed later
 
 // Function called by /connect command to store the state temporarily
 function storeState(state, discordId) {
-    stateStore.set(state, discordId);
+    const expiresAt = Date.now() + (10 * 60 * 1000); // 10 minutes from now
+    stateStore.set(state, { discordId, expiresAt });
+    
     // Simple cleanup for old states (e.g., remove after 10 minutes)
     setTimeout(() => {
         if (stateStore.has(state)) {
-            console.log(`[State Store] Cleaning up expired state: ${state}`);
+            Logger.info('state cleanup', `Cleaning up expired state: ${state}`);
             stateStore.delete(state);
         }
     }, 10 * 60 * 1000);
 }
+
+// Cleanup expired states every hour
+setInterval(() => {
+    const now = Date.now();
+    for (const [state, data] of stateStore.entries()) {
+        if (now > data.expiresAt) {
+            Logger.info('state cleanup', `Cleaning up expired state: ${state}`);
+            stateStore.delete(state);
+        }
+    }
+}, 60 * 60 * 1000); // 1 hour
 
 module.exports = { startWebServer, storeState };

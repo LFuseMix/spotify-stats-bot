@@ -6,6 +6,7 @@ const fetch = require('node-fetch');
 const AdmZip = require('adm-zip');
 const path = require('node:path');
 const { getUser, addHistoryEntries } = require('../utils/database');
+const { getUserSpotifyApi, chunkArray } = require('../utils/spotify'); // Import spotify utils
 
 module.exports = {
     data: new SlashCommandBuilder()
@@ -85,66 +86,134 @@ module.exports = {
                     try {
                         const jsonString = zip.readAsText(zipEntry);
                         const historyData = JSON.parse(jsonString);
-                        if (!Array.isArray(historyData)) { /* ... handle invalid format ... */ continue; }
+                        if (!Array.isArray(historyData)) { /* ... handle invalid format ... */ console.warn(`[Upload] Invalid format in ${zipEntry.entryName}: expected array.`); failedJsonFiles.push(zipEntry.entryName); continue; }
                         let fileEntriesPassed = 0;
                         totalEntriesChecked += historyData.length;
-                        const validEntriesFromFile = historyData.filter((entry, index) => {
-                            // Basic field presence checks
-                            const hasTs = !!entry.ts;
-                            const hasTrackName = !!entry.master_metadata_track_name;
-                            const hasArtistName = !!entry.master_metadata_album_artist_name;
-                            const hasValidMsPlayed = typeof entry.ms_played === 'number';
+
+                        // Process and filter entries before adding to allHistoryEntries
+                        const processedEntriesFromFile = historyData.map(originalEntry => {
+                            // Basic field presence checks for filtering
+                            const hasOriginalTs = !!originalEntry.ts;
+                            const hasTrackName = !!originalEntry.master_metadata_track_name;
+                            const hasArtistName = !!originalEntry.master_metadata_album_artist_name;
+                            const hasValidMsPlayed = typeof originalEntry.ms_played === 'number';
                             
-                            // Validate timestamp format and range
+                            let parsedUnixTimestampSeconds = null;
                             let isValidTimestamp = false;
-                            if (hasTs) {
+                            if (hasOriginalTs) {
                                 try {
-                                    // Convert timestamp to milliseconds if it's in seconds (less than 1e12)
-                                    const timestampMs = entry.ts < 1e12 ? entry.ts * 1000 : entry.ts;
-                                    const timestamp = new Date(timestampMs);
-                                    // Check if timestamp is valid and within reasonable range (2000-2100)
-                                    isValidTimestamp = !isNaN(timestamp.getTime()) && 
-                                        timestamp.getFullYear() >= 2000 && 
-                                        timestamp.getFullYear() <= 2100;
-                                    
-                                    if (!isValidTimestamp && index < 5) {
-                                        console.log(`[Debug Invalid Timestamp #${index + 1} in ${baseName}] Value: ${entry.ts}, Parsed: ${timestamp}`);
+                                    const parsedDate = new Date(originalEntry.ts); // Parse ISO string
+                                    if (!isNaN(parsedDate.getTime())) {
+                                        parsedUnixTimestampSeconds = Math.floor(parsedDate.getTime() / 1000);
+                                        isValidTimestamp = parsedUnixTimestampSeconds >= 946684800 && parsedUnixTimestampSeconds <= 4102444799; // Approx 2000-01-01 to 2100-01-01
                                     }
-                                } catch (e) {
-                                    if (index < 5) {
-                                        console.log(`[Debug Timestamp Parse Error #${index + 1} in ${baseName}] Value: ${entry.ts}, Error: ${e.message}`);
-                                    }
-                                }
+                                } catch (e) { /* Invalidate timestamp on error */ }
                             }
 
-                            const isValid = hasTs && hasTrackName && hasArtistName && hasValidMsPlayed && isValidTimestamp;
+                            const isValid = hasOriginalTs && isValidTimestamp && hasTrackName && hasArtistName && hasValidMsPlayed;
                             
-                            // Keep debug logging for first 5 invalid entries
-                            if (!isValid && index < 5) {
-                                console.log(`[Debug Filter Fail Entry #${index + 1} in ${baseName}] Checks: ts=${hasTs}, valid_ts=${isValidTimestamp}, track=${hasTrackName}, artist=${hasArtistName}, ms_played=${hasValidMsPlayed}`);
+                            if (!isValid) {
+                                // console.log(`[Debug Filter Fail Entry in ${baseName}] Original ts: ${originalEntry.ts}, Parsed ts: ${parsedUnixTimestampSeconds}, Valid ts: ${isValidTimestamp}, Track: ${hasTrackName}, Artist: ${hasArtistName}, ms_played: ${hasValidMsPlayed}`);
+                                return null; // Mark as invalid to be filtered out
                             }
                             
-                            if (isValid) fileEntriesPassed++;
-                            return isValid;
-                        });
-                        allHistoryEntries = allHistoryEntries.concat(validEntriesFromFile);
-                        totalEntriesPassedFilter += fileEntriesPassed;
-                        if (fileEntriesPassed > 0) { processedJsonFiles++; console.log(`[Upload] Extracted ${fileEntriesPassed} entries from ${zipEntry.entryName}.`);}
-                        else if (historyData.length > 0) { console.log(`[Upload] Parsed ${zipEntry.entryName}, but 0 entries passed filter.`); }
+                            fileEntriesPassed++;
+                            // Return a new object with the processed timestamp for addHistoryEntries
+                            return {
+                                ts: parsedUnixTimestampSeconds, // Unix timestamp in seconds
+                                ms_played: originalEntry.ms_played,
+                                master_metadata_track_name: originalEntry.master_metadata_track_name,
+                                master_metadata_album_artist_name: originalEntry.master_metadata_album_artist_name,
+                                master_metadata_album_name: originalEntry.master_metadata_album_album_name,
+                                spotify_track_uri: originalEntry.spotify_track_uri
+                                // other fields like conn_country, ip_addr, platform, etc., are not used by addHistoryEntries
+                            };
+                        }).filter(entry => entry !== null); // Remove nulls (invalid entries)
+
+                        allHistoryEntries = allHistoryEntries.concat(processedEntriesFromFile);
+                        totalEntriesPassedFilter += fileEntriesPassed; // This count is based on successful mapping now
+
+                        if (fileEntriesPassed > 0) { processedJsonFiles++; console.log(`[Upload] Extracted and validated ${fileEntriesPassed} entries from ${zipEntry.entryName}.`);}
+                        else if (historyData.length > 0) { console.log(`[Upload] Parsed ${zipEntry.entryName}, but 0 entries passed validation.`); }
                         else { console.log(`[Upload] Parsed ${zipEntry.entryName}, file was empty.`); }
-                    } catch (parseError) { /* ... handle parse error ... */ }
+                    } catch (parseError) { /* ... handle parse error ... */ console.error(`[Upload] Error parsing ${zipEntry.entryName}:`, parseError); failedJsonFiles.push(zipEntry.entryName); }
                 }
             } // End loop
 
             console.log(`[Upload Debug] Checked: ${totalEntriesChecked}, Passed: ${totalEntriesPassedFilter}`);
 
-            if (!foundAnyHistoryFiles) { /* ... throw error ... */ }
+            if (!foundAnyHistoryFiles) {
+                // Throw an error or handle as appropriate for your application
+                await interaction.editReply("No 'Streaming_History_*.json' files found in the zip.");
+                return;
+            }
 
             if (allHistoryEntries.length > 0) {
-                 // ... (add entries to db) ...
+                // --- New: Fetch track durations from Spotify API ---
+                let entriesWithFetchedDurations = 0;
+                let entriesFailedDurationFetch = 0;
+                try {
+                    const spotifyApi = await getUserSpotifyApi(discordId);
+                    if (spotifyApi) {
+                        const trackUris = [...new Set(allHistoryEntries.map(entry => entry.spotify_track_uri).filter(uri => uri))]
+                            .map(uri => uri.startsWith('spotify:track:') ? uri.split(':')[2] : null) // Ensure correct URI format and extract ID
+                            .filter(id => id); 
+
+                        if (trackUris.length > 0) {
+                            await interaction.editReply({ content: `Processing ${allHistoryEntries.length} entries... Fetching track durations from Spotify for ${trackUris.length} unique tracks. This might take a moment...` });
+                            
+                            const trackChunks = chunkArray(trackUris, 50); // Spotify API limit is 50 tracks per request
+                            const trackDurationMap = new Map();
+
+                            for (const chunk of trackChunks) {
+                                try {
+                                    const tracksData = await spotifyApi.getTracks(chunk);
+                                    if (tracksData.body && tracksData.body.tracks) {
+                                        tracksData.body.tracks.forEach(track => {
+                                            if (track && track.id && typeof track.duration_ms === 'number') {
+                                                trackDurationMap.set(`spotify:track:${track.id}`, track.duration_ms);
+                                            }
+                                        });
+                                    }
+                                } catch (apiError) {
+                                    console.warn(`[Upload] Spotify API error fetching track chunk: ${apiError.message}. Some durations might use original values.`);
+                                }
+                            }
+
+                            allHistoryEntries = allHistoryEntries.map(entry => {
+                                if (entry.spotify_track_uri && trackDurationMap.has(entry.spotify_track_uri)) {
+                                    entry.ms_played = trackDurationMap.get(entry.spotify_track_uri);
+                                    entriesWithFetchedDurations++;
+                                } else if (entry.spotify_track_uri) {
+                                    // Keep original ms_played if URI was valid but track not found or no duration
+                                    // Or if it's not a Spotify URI
+                                    entriesFailedDurationFetch++;
+                                }
+                                return entry;
+                            });
+                            console.log(`[Upload] Fetched durations for ${entriesWithFetchedDurations} entries. Failed/Kept original for ${entriesFailedDurationFetch} entries.`);
+                        }
+                    } else {
+                        console.warn(`[Upload] Could not get Spotify API for user ${discordId}. Using original ms_played values.`);
+                        await interaction.editReply({ content: `Processing ${allHistoryEntries.length} entries... Could not connect to Spotify to fetch exact durations. Using durations from your file.`});
+                    }
+                } catch (e) {
+                    console.error(`[Upload] Error during Spotify duration fetch for ${discordId}:`, e);
+                    // Notify user but proceed with original ms_played
+                     await interaction.editReply({ content: `Processing ${allHistoryEntries.length} entries... Error fetching exact durations from Spotify. Using durations from your file.`});
+                }
+                // --- End New ---
+
+
                  const result = addHistoryEntries(discordId, allHistoryEntries, 'upload');
                  // ... (build success reply message) ...
                  let replyMessage = `Successfully processed \`${attachment.name}\`!\n- Found/parsed **${processedJsonFiles}** files.\n- Added **${result.added}** new entries.\n- Skipped **${result.skipped}** (duplicates/invalid).\n`;
+                 if (entriesWithFetchedDurations > 0) {
+                     replyMessage += `- Updated **${entriesWithFetchedDurations}** entries with official Spotify durations.\n`;
+                 }
+                 if (entriesFailedDurationFetch > 0) {
+                     replyMessage += `- Used original duration for **${entriesFailedDurationFetch}** entries (not found on Spotify or already accurate).\n`;
+                 }
                  if (result.invalidEntries > 0) {
                      replyMessage += `- ⚠️ Found **${result.invalidEntries}** invalid entries (skipped).\n`;
                  }

@@ -1,14 +1,14 @@
 # Terms of Service
 
-**Effective Date:** 5/9/25
+**Effective Date:** 5/29/2025
 
-Welcome to the Spotify Stats Bot! By using this Discord bot ("the Service"), you agree to the following terms:
+Welcome to Hershey 🎷 (Spotify Stats Bot)! By using this Discord bot ("the Service"), you agree to the following terms:
 
 ## 1. Acceptance of Terms
-By using the Spotify Stats Bot, you agree to comply with and be bound by these Terms of Service. If you do not agree, please do not use the Service.
+By using Hershey, you agree to comply with and be bound by these Terms of Service. If you do not agree, please do not use the Service.
 
 ## 2. Description of Service
-Spotify Stats Bot provides analytics and insights based on your Spotify listening history. The Service is provided as-is, without warranty of any kind.
+Hershey provides analytics and insights based on your Spotify listening history. The Service is provided as-is, without warranty of any kind.
 
 ## 3. User Responsibilities
 - You must comply with Discord's Terms of Service and Spotify's Terms of Use.
@@ -26,8 +26,8 @@ The Service is provided "as is". The owner (LFuse) is not liable for any damages
 We may update these Terms at any time. Continued use of the Service means you accept the new Terms.
 
 ## 7. Contact
-For questions or support, contact us at [ntatschool@outlook.com](mailto:ntatschool@outlook.com) or join our [support server](https://discord.com/invite/kB5D658vbT).
+For questions or support, contact us at [ntatschool@outlook.com](mailto:ntatschool@outlook.com) or join our [support server](https://discord.gg/GJKQJjcsGA).
 
 ---
 
-© 2024 LFuse. All rights reserved. 
+© 2025 LFuse. All rights reserved. 

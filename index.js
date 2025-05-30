@@ -8,6 +8,14 @@ const { startWebServer } = require('./web/server');
 const { initializeNgrok, getUserSpotifyApi, updateRedirectUri } = require('./utils/spotify'); // Added getUserSpotifyApi, updateRedirectUri
 const SpotifyWebApi = require('spotify-web-api-node'); // Needed for type checking
 const trackerLogger = require('./utils/trackerLogger'); // <-- Add this line
+const cron = require('node-cron'); // Added for log rotation
+const { cleanOldLogEntries } = require('./utils/logRotator'); // Added for log rotation
+const { manageLogCleanupState, shouldRunCleanup } = require('./utils/logCleanupStateManager'); // Added for log rotation state
+const Logger = require('./utils/logger'); // Add our new logger
+const { displayShutdownSummary, trackCommandUsage } = require('./utils/shutdownStats'); // Add shutdown stats
+
+// Store bot start time for uptime calculation
+const BOT_START_TIME = Date.now();
 
 dotenv.config();
 
@@ -15,7 +23,7 @@ dotenv.config();
 const requiredEnv = ['DISCORD_TOKEN', 'SPOTIFY_CLIENT_ID', 'SPOTIFY_CLIENT_SECRET', 'GEMINI_API_KEY', 'PORT'];
 const missingEnv = requiredEnv.filter(envVar => !process.env[envVar]);
 if (missingEnv.length > 0) {
-    console.error(`[FATAL ERROR] Missing required environment variables: ${missingEnv.join(', ')}`);
+    Logger.error('startup', 'Missing required environment variables', missingEnv.join(', '));
     process.exit(1);
 }
 // --- End Check ---
@@ -29,32 +37,50 @@ const client = new Client({
 // --- Command Handling ---
 client.commands = new Collection();
 const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
-for (const file of commandFiles) {
-    const filePath = path.join(commandsPath, file);
+
+// Function to recursively find all .js files in a directory (same as in deploy-commands.js)
+function findCommandFiles(directory) {
+    let commandFiles = [];
+    const files = fs.readdirSync(directory, { withFileTypes: true });
+
+    for (const file of files) {
+        const filePath = path.join(directory, file.name);
+        if (file.isDirectory()) {
+            commandFiles = commandFiles.concat(findCommandFiles(filePath));
+        } else if (file.name.endsWith('.js')) {
+            commandFiles.push(filePath);
+        }
+    }
+    return commandFiles;
+}
+
+const commandFiles = findCommandFiles(commandsPath); // Use the recursive function
+
+for (const filePath of commandFiles) { // Iterate over full file paths
     const command = require(filePath);
     if ('data' in command && 'execute' in command) {
         client.commands.set(command.data.name, command);
-        console.log(`[Commands] Loaded command ${command.data.name}`);
+        Logger.info('commands', `Loaded command: ${command.data.name}`);
     } else {
-        console.log(`[WARNING] The command at ${filePath} is missing a required "data" or "execute" property.`);
+        Logger.warn('commands', `Command missing required properties`, `File: ${filePath}`);
     }
 }
 
 // --- Variable for Tracking Interval ---
 let recentTrackInterval = null; // Holds the interval ID for shutdown
+let dailyLogCleanupTask = null; // Holds the cron task for log cleanup
 
 // --- Event Handling ---
 client.once('ready', async () => {
-    console.log(`Logged in as ${client.user.tag}!`);
-    client.user.setActivity('your Spotify stats 👀', { type: ActivityType.Watching }); // Use ActivityType enum
+    Logger.system(`Hershey 🎷 logged in as ${client.user.tag}!`);
+    client.user.setActivity('your Spotify stats 🎷', { type: ActivityType.Watching }); // Use ActivityType enum
 
     // Initialize Database
     try {
         initializeDatabase();
-        console.log('[Database] Initialized successfully.');
+        Logger.success('database', 'Database initialized successfully');
     } catch (dbError) {
-        console.error('[FATAL ERROR] Failed to initialize database:', dbError);
+        Logger.error('database', 'Failed to initialize database', dbError.message);
         process.exit(1);
     }
 
@@ -63,21 +89,40 @@ client.once('ready', async () => {
         const port = process.env.PORT || 8888;
         const ngrokUrl = await initializeNgrok(port);
         if (ngrokUrl) {
-            console.log(`[Ngrok] Tunnel running at: ${ngrokUrl}`);
-            console.log(`[Spotify] IMPORTANT: Update SPOTIFY_REDIRECT_URI in Spotify Developer Dashboard to: ${ngrokUrl}/callback`);
+            Logger.network('ngrok', 'connect', `Tunnel running at: ${ngrokUrl}`);
+            Logger.info('spotify', 'IMPORTANT: Update SPOTIFY_REDIRECT_URI in Spotify Developer Dashboard', `${ngrokUrl}/callback`);
             // Dynamic update happens inside initializeNgrok now via updateRedirectUri
             startWebServer(client, port);
-            console.log(`[Web Server] Listening on port ${port} for Spotify callback.`);
+            Logger.network('web server', 'start', `Listening on port ${port} for Spotify callback`);
 
             // --- Start Recent Track Polling AFTER everything is ready ---
             startRecentTrackPolling(); // Call the new function
 
+            // --- Initialize and Schedule Log Cleanup ---
+            if (await shouldRunCleanup()) {
+                Logger.info('startup', 'Running initial log cleanup check...');
+                await cleanOldLogEntries();
+                await manageLogCleanupState.updateLastCleanupDate();
+            }
+            // Schedule daily cleanup at midnight
+            // cron.schedule(expression, callback, options)
+            // expression: second (0-59, optional) minute (0-59) hour (0-23) day_of_month (1-31) month (1-12) day_of_week (0-7, 0 or 7 is Sun)
+            dailyLogCleanupTask = cron.schedule('0 0 * * *', async () => { // Every day at midnight
+                Logger.info('cron', 'Running daily log cleanup...');
+                await cleanOldLogEntries();
+                await manageLogCleanupState.updateLastCleanupDate();
+            }, {
+                scheduled: true,
+                timezone: "Etc/UTC" // Or your preferred timezone
+            });
+            Logger.success('cron', 'Log cleanup scheduled daily at midnight UTC');
+
         } else {
-             console.error('[FATAL ERROR] Failed to initialize Ngrok. Spotify authentication will not work.');
+             Logger.error('ngrok', 'Failed to initialize Ngrok - Spotify authentication will not work');
              // process.exit(1); // Decide if critical
         }
     } catch (webError) {
-        console.error('[FATAL ERROR] Failed to start web server or Ngrok:', webError);
+        Logger.error('startup', 'Failed to start web server or Ngrok', webError.message);
         process.exit(1);
     }
 
@@ -89,67 +134,67 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     const command = interaction.client.commands.get(interaction.commandName);
     if (!command) {
-        console.error(`No command matching ${interaction.commandName} was found.`);
+        Logger.error('interaction', `No command matching ${interaction.commandName} was found`);
         try { await interaction.reply({ content: 'Error: Command not found!', ephemeral: true }); }
-        catch (replyError) { console.error(`[Interaction Error] Failed to reply to unknown command:`, replyError); }
+        catch (replyError) { Logger.error('interaction', 'Failed to reply to unknown command', replyError.message); }
         return;
     }
     try {
-        console.log(`[Interaction] User ${interaction.user.tag} (${interaction.user.id}) used command: /${interaction.commandName}`);
+        Logger.interaction(`${interaction.user.tag} (${interaction.user.id})`, interaction.commandName);
+        
+        // Track command usage for shutdown statistics
+        trackCommandUsage(interaction.commandName);
+        
         await command.execute(interaction);
     } catch (error) {
-        console.error(`[Interaction Error] Error executing /${interaction.commandName}:`, error);
+        Logger.error('interaction', `Error executing /${interaction.commandName}`, error.message);
         const errorMessage = { content: 'There was an error while executing this command!', ephemeral: true };
         if (interaction.replied || interaction.deferred) {
-            await interaction.followUp(errorMessage).catch(followUpError => console.error(`[Interaction Error] Failed to follow up after error:`, followUpError));
+            await interaction.followUp(errorMessage).catch(followUpError => Logger.error('interaction', 'Failed to follow up after error', followUpError.message));
         } else {
-            await interaction.reply(errorMessage).catch(replyError => console.error(`[Interaction Error] Failed to reply with error:`, replyError));
+            await interaction.reply(errorMessage).catch(replyError => Logger.error('interaction', 'Failed to reply with error', replyError.message));
         }
     }
 });
 
 // --- Recent Track Polling Functionality ---
 
-const POLLING_INTERVAL_MS = 60 * 1000; // 1 minute
-const DELAY_BETWEEN_USERS_MS = 500; // 0.5 seconds delay between checking each user
+const POLLING_INTERVAL_MS = 90 * 1000; // 1.5 minutes (was 1 minute) - more conservative to avoid rate limits
+const DELAY_BETWEEN_USERS_MS = 1000; // 1 second delay between checking each user (was 0.5 seconds)
 
 async function pollRecentTracks() {
-    trackerLogger.log('Starting recent track poll cycle...');
+    Logger.tracker('cycle_start', `🔄 Starting polling cycle - checking ${getAllConnectedUsers()?.length || 0} connected users`);
+    
     const users = getAllConnectedUsers();
     if (!users || users.length === 0) {
-        trackerLogger.log('No connected users found to poll.');
+        Logger.tracker('cycle_end', 'No connected users found to poll');
         return;
     }
 
-    trackerLogger.log(`Found ${users.length} connected users to check.`);
     let totalFetched = 0;
     let totalAdded = 0;
     let totalSkipped = 0;
     let usersFailed = 0;
 
     for (const user of users) {
-        trackerLogger.log(`Processing user ${user.discord_id}...`);
         try {
             const spotifyApi = await getUserSpotifyApi(user.discord_id); // Handles token refresh
 
             if (!spotifyApi) {
-                trackerLogger.warn(`Could not get valid Spotify API client for user ${user.discord_id}. Skipping.`);
+                Logger.warn('tracker', `Could not get valid Spotify API client for user ${user.discord_id}`, 'Skipping user');
                 usersFailed++;
                 continue;
             }
 
             // Fetch recently played tracks (max 50)
-            trackerLogger.log(`Fetching recent tracks for user ${user.discord_id}...`);
             const recentData = await spotifyApi.getMyRecentlyPlayedTracks({ limit: 50 });
 
             if (recentData.body && recentData.body.items && recentData.body.items.length > 0) {
-                trackerLogger.log(`Found ${recentData.body.items.length} recent tracks for user ${user.discord_id}`);
                 totalFetched += recentData.body.items.length;
                 const entriesToSave = [];
 
                 for (const item of recentData.body.items) {
                     if (!item.track || !item.played_at || !item.track.name || !item.track.artists || item.track.artists.length === 0) {
-                        trackerLogger.warn(`Skipping invalid item for user ${user.discord_id}:`, item);
                         continue;
                     }
 
@@ -160,7 +205,6 @@ async function pollRecentTracks() {
                         if (isNaN(playedAtDate.getTime())) throw new Error('Invalid date parsed');
                         timestampInSeconds = Math.floor(playedAtDate.getTime() / 1000);
                     } catch (timeError) {
-                        trackerLogger.warn(`Error parsing 'played_at' timestamp ${item.played_at} for user ${user.discord_id}. Skipping item.`, timeError);
                         continue;
                     }
 
@@ -176,30 +220,34 @@ async function pollRecentTracks() {
                 }
 
                 if (entriesToSave.length > 0) {
-                    trackerLogger.log(`Saving ${entriesToSave.length} entries for user ${user.discord_id}...`);
                     const result = addHistoryEntries(user.discord_id, entriesToSave, 'recent');
-                    trackerLogger.log(`Save results for user ${user.discord_id}: Added ${result.added}, Skipped ${result.skipped}`);
+                    
+                    // Log each individual new track that was added
+                    if (result.addedTracks && result.addedTracks.length > 0) {
+                        for (const track of result.addedTracks) {
+                            Logger.tracker('new_track', `🎵 ${track.trackName} by ${track.artistName}`, `User: ${track.discordId}`);
+                        }
+                    }
+                    
                     totalAdded += result.added;
                     totalSkipped += result.skipped;
-                } else {
-                    trackerLogger.log(`No valid entries to save for user ${user.discord_id}`);
                 }
-            } else {
-                trackerLogger.log(`No recent tracks found for user ${user.discord_id}`);
             }
         } catch (error) {
             usersFailed++;
-            if (error instanceof SpotifyWebApi.SpotifyWebApiError || error.body?.error) {
+            // Check for Spotify API errors by looking at error properties rather than using instanceof
+            if (error.statusCode && error.body) {
+                // This is likely a Spotify API error with status code and body
                 const spotifyError = error.body?.error || {};
                 const statusCode = error.statusCode;
-                trackerLogger.error(`Spotify API Error for user ${user.discord_id}: Status ${statusCode}, Message: ${spotifyError.message || error.message}`);
+                Logger.error('tracker', `Spotify API Error for user ${user.discord_id}`, `Status ${statusCode}: ${spotifyError.message || error.message}`);
                 if (statusCode === 429) { 
-                    trackerLogger.warn('Rate limit hit. Consider increasing interval or delay.'); 
+                    Logger.warn('tracker', 'Rate limit hit', 'Consider increasing interval or delay'); 
                 } else if (statusCode === 401 || statusCode === 403) { 
-                    trackerLogger.warn(`Auth error for user ${user.discord_id}. They may need to /connect again.`); 
+                    Logger.warn('tracker', `Auth error for user ${user.discord_id}`, 'User may need to /connect again'); 
                 }
             } else {
-                trackerLogger.error(`Unexpected Error processing user ${user.discord_id}:`, error);
+                Logger.error('tracker', `Unexpected error processing user ${user.discord_id}`, error.message || error.toString());
             }
         }
 
@@ -207,19 +255,23 @@ async function pollRecentTracks() {
         await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_USERS_MS));
     }
 
-    trackerLogger.log(`Poll cycle finished. Processed ${users.length} users. Total Fetched Items: ${totalFetched}, Added: ${totalAdded}, Skipped: ${totalSkipped}, Failed Users: ${usersFailed}.`);
+    if (totalAdded === 0 && totalSkipped === 0 && usersFailed === 0) {
+        Logger.tracker('cycle_end', `✅ Polling complete - no new tracks found`);
+    } else {
+        Logger.tracker('cycle_end', `✅ Polling complete`, `New tracks: ${totalAdded}, Duplicates: ${totalSkipped}, Failed users: ${usersFailed}`);
+    }
 }
 
 function startRecentTrackPolling() {
     if (recentTrackInterval) {
-        console.warn('[Tracker] Polling interval already started.');
+        Logger.warn('tracker', 'Polling interval already started');
         return;
     }
-    console.log(`[Tracker] Starting recent track polling every ${POLLING_INTERVAL_MS / 1000 / 60} minutes.`);
+    Logger.tracker('start', `Starting recent track polling every ${POLLING_INTERVAL_MS / 1000 / 60} minutes`);
     // Run once immediately, then set interval
-    pollRecentTracks().catch(err => console.error('[Tracker] Initial poll failed:', err)); // Run initial poll
+    pollRecentTracks().catch(err => Logger.error('tracker', 'Initial poll failed', err.message)); // Run initial poll
     recentTrackInterval = setInterval(() => {
-        pollRecentTracks().catch(err => console.error('[Tracker] Poll cycle failed:', err)); // Catch errors in interval calls
+        pollRecentTracks().catch(err => Logger.error('tracker', 'Poll cycle failed', err.message)); // Catch errors in interval calls
     }, POLLING_INTERVAL_MS);
 }
 
@@ -230,61 +282,75 @@ client.login(process.env.DISCORD_TOKEN);
 const ngrok = require('ngrok'); // Ensure ngrok is required here
 
 async function shutdown(signal) {
-    console.log(`\n[${signal}] Received signal. Shutting down gracefully...`);
+    Logger.section('GRACEFUL SHUTDOWN INITIATED', 'red');
 
-    // 0. Stop Polling Interval
+    // 0. Display beautiful shutdown summary
+    try {
+        displayShutdownSummary(signal, BOT_START_TIME);
+    } catch (error) {
+        Logger.error('shutdown', 'Error displaying shutdown summary', error.message);
+    }
+
+    // 1. Stop Polling Interval
     if (recentTrackInterval) {
-        console.log('[Shutdown] Stopping track polling interval...');
+        Logger.shutdown('1', 'Stopping track polling interval...');
         clearInterval(recentTrackInterval);
         recentTrackInterval = null; // Clear variable
-        console.log('[Shutdown] Polling interval stopped.');
+        Logger.success('shutdown', 'Polling interval stopped');
     }
 
-    // 1. Disconnect Ngrok
+    // Stop cron job
+    if (dailyLogCleanupTask) {
+        Logger.shutdown('2', 'Stopping daily log cleanup task...');
+        dailyLogCleanupTask.stop();
+        Logger.success('shutdown', 'Log cleanup task stopped');
+    }
+
+    // 2. Disconnect Ngrok
     try {
-        console.log('[Shutdown] Disconnecting Ngrok...');
+        Logger.shutdown('3', 'Disconnecting Ngrok...');
         await ngrok.disconnect();
-        console.log('[Shutdown] Ngrok disconnected.');
+        Logger.success('shutdown', 'Ngrok disconnected');
     } catch (err) {
-        console.error('[Shutdown] Error disconnecting Ngrok:', err);
+        Logger.error('shutdown', 'Error disconnecting Ngrok', err.message);
     }
 
-    // 2. Close Database Connection
+    // 3. Close Database Connection
     try {
         const db = getDbInstance();
         if (db && db.open) {
-             console.log('[Shutdown] Closing database connection...');
+             Logger.shutdown('4', 'Closing database connection...');
              db.close((err) => { // Use callback for close confirmation/error
                  if (err) {
-                     console.error('[Shutdown] Error closing database:', err.message);
+                     Logger.error('shutdown', 'Error closing database', err.message);
                  } else {
-                     console.log('[Shutdown] Database connection closed.');
+                     Logger.success('shutdown', 'Database connection closed');
                  }
              });
         }
     } catch (err) { // Catch errors from getDbInstance itself
-        console.error('[Shutdown] Error getting DB instance for closing:', err);
+        Logger.error('shutdown', 'Error getting DB instance for closing', err.message);
     }
 
-    // 3. Destroy Discord Client
-    console.log('[Shutdown] Destroying Discord client...');
+    // 4. Destroy Discord Client
+    Logger.shutdown('5', 'Destroying Discord client...');
     client.destroy();
-    console.log('[Shutdown] Discord client destroyed.');
+    Logger.success('shutdown', 'Discord client destroyed');
 
-    // 4. Exit Process - Use setTimeout to allow async close operations (like db.close) to attempt completion
-    console.log('[Shutdown] Exiting process shortly...');
+    // 5. Exit Process - Use setTimeout to allow async close operations (like db.close) to attempt completion
+    Logger.shutdown('6', 'Exiting process shortly...');
     setTimeout(() => process.exit(0), 1500); // Allow 1.5 seconds for cleanup
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', error => {
-    console.error('[FATAL] Unhandled Promise Rejection:', error);
+    Logger.error('fatal', 'Unhandled Promise Rejection', error.message);
     // Attempt shutdown but exit faster on unhandled errors
     shutdown('Unhandled Rejection').catch(() => {}).finally(() => setTimeout(() => process.exit(1), 500));
 });
 process.on('uncaughtException', error => {
-    console.error('[FATAL] Uncaught Exception:', error);
+    Logger.error('fatal', 'Uncaught Exception', error.message);
     shutdown('Uncaught Exception').catch(() => {}).finally(() => setTimeout(() => process.exit(1), 500));
 });
 // --- End Graceful Shutdown ---

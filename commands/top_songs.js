@@ -1,7 +1,7 @@
 // commands/top_songs.js
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 // *** Ensure getDbInstance is imported ***
-const { getUser, getTopSongs, getDbInstance } = require('../utils/database'); // Make sure getDbInstance is here
+const { getUser, getTopSongs, getDbInstance, getTotalStatsForPeriod, isUserProfilePublic, getUserByDiscordId } = require('../utils/database'); // Make sure getDbInstance is here
 const { getTimestampsForPeriod, formatDuration } = require('../utils/dateUtils');
 const { generateProgressBar } = require('../utils/progressBar');
 const config = require('../config.json');
@@ -42,15 +42,47 @@ module.exports = {
                     { name: 'Last 6 Months', value: '6m' },
                     { name: 'Last Year', value: '1y' },
                     { name: 'All Time', value: 'all' }
-                )),
+                ))
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('View another user\'s top songs (they must have public profile).')
+                .setRequired(false)
+        ),
     async execute(interaction) {
-        const discordId = interaction.user.id;
+        const requestingUserId = interaction.user.id;
+        const targetUser = interaction.options.getUser('user');
+        const targetUserId = targetUser ? targetUser.id : requestingUserId;
         const limit = interaction.options.getInteger('top');
         const period = interaction.options.getString('period');
 
-        const user = getUser(discordId);
-        if (!user || !user.spotify_id) {
+        // Check if viewing another user's stats
+        const isViewingOtherUser = targetUserId !== requestingUserId;
+
+        // Get requesting user info (for embed color, etc.)
+        const requestingUser = getUser(requestingUserId);
+        if (!requestingUser || !requestingUser.spotify_id) {
             return interaction.reply({ content: 'You need to connect your Spotify account first using `/connect`.', ephemeral: true });
+        }
+
+        // Get target user info
+        const user = getUserByDiscordId(targetUserId);
+        if (!user || !user.spotify_id) {
+            if (isViewingOtherUser) {
+                return interaction.reply({ content: `${targetUser.username} hasn't connected their Spotify account yet.`, ephemeral: true });
+            } else {
+                return interaction.reply({ content: 'You need to connect your Spotify account first using `/connect`.', ephemeral: true });
+            }
+        }
+
+        // Privacy check for viewing other users
+        if (isViewingOtherUser) {
+            const isPublic = isUserProfilePublic(targetUserId);
+            if (!isPublic) {
+                return interaction.reply({ 
+                    content: `${targetUser.username}'s profile is private. They need to use \`/privacy setting:public\` to allow others to view their stats.`, 
+                    ephemeral: true 
+                });
+            }
         }
 
         await interaction.deferReply();
@@ -64,7 +96,13 @@ module.exports = {
             console.log(`[Debug ${interaction.commandName}] End Time: ${endTime} (${new Date(endTime * 1000).toISOString()})`);
             console.log(`[Debug ${interaction.commandName}] Current Time: ${Math.floor(Date.now() / 1000)} (${new Date().toISOString()})`);
 
-            const topSongsData = getTopSongs(discordId, limit, startTime, endTime); // This now includes spotify_track_uri
+            const topSongsData = getTopSongs(targetUserId, limit, startTime, endTime); // This now includes spotify_track_uri
+            
+            // Get total stats for the period
+            const totalStats = getTotalStatsForPeriod(targetUserId, startTime, endTime);
+
+            // Log the raw data received from getTopSongs
+            console.log(`[Debug ${interaction.commandName}] Raw topSongsData from DB:`, JSON.stringify(topSongsData, null, 2));
 
             // Check if the main query returned results
             if (!topSongsData || topSongsData.length === 0) {
@@ -75,50 +113,66 @@ module.exports = {
                 // Get the database instance *before* trying to use it
                 const db = getDbInstance();
                 // Now use the db instance to prepare and run the check query
-                const hasAnyData = db.prepare('SELECT 1 FROM history WHERE discord_id = ? LIMIT 1').get(discordId);
+                const hasAnyData = db.prepare('SELECT 1 FROM history WHERE discord_id = ? LIMIT 1').get(targetUserId);
                 // --- END OF FIX ---
 
                  if(hasAnyData) {
                     // Explain *why* no data might be found (ms_played filter for stats, or just no plays in window)
-                    return interaction.editReply(`Couldn't find any songs matching your criteria in the ${periodName} period (note: requires plays > 3 seconds for stats). Try 'All Time' or check your upload.`);
+                    const userName = isViewingOtherUser ? targetUser.username : 'you';
+                    return interaction.editReply(`Couldn't find any songs matching the criteria for ${userName} in the ${periodName} period (note: requires plays > 3 seconds for stats). Try 'All Time' or check the upload.`);
                  } else {
-                     return interaction.editReply(`I don't have any listening history stored for you yet. Use the \`/upload\` command first.`);
+                     const userName = isViewingOtherUser ? targetUser.username : 'you';
+                     return interaction.editReply(`I don't have any listening history stored for ${userName} yet. ${isViewingOtherUser ? 'They need' : 'You need'} to use the \`/upload\` command first.`);
                  }
             }
 
             // --- Embed Building (Only runs if topSongsData has items) ---
+            const displayName = isViewingOtherUser ? targetUser.username : interaction.user.username;
             const embed = new EmbedBuilder()
                 .setColor(user.embed_color || config.defaultEmbedColor)
-                .setTitle(`🏆 ${interaction.user.username}'s Top ${topSongsData.length} Songs (${periodName})`);
+                .setTitle(`🏆 ${displayName}'s Top ${topSongsData.length} Songs (${periodName})`)
+                .addFields({
+                    name: '📊 Total Period Activity',
+                    value: `**Total Listening Time:** ${formatDuration(totalStats.totalMsPlayed)}\n**All Songs Played:** ${totalStats.totalPlayCount.toLocaleString()} plays`,
+                    inline: false
+                });
+
+            // Add privacy indicator if viewing someone else's profile
+            if (isViewingOtherUser) {
+                embed.setFooter({
+                    text: `${targetUser.username} has a public profile • Data provided by Spotify`,
+                    iconURL: SPOTIFY_LOGO_URL
+                });
+            } else {
+                embed.setFooter({
+                    text: 'Data provided by Spotify',
+                    iconURL: SPOTIFY_LOGO_URL
+                });
+            }
 
             let description = '';
             const maxMsPlayed = topSongsData[0]?.total_ms_played || 1; // Use top song's time for scaling, avoid 0
 
             topSongsData.forEach((song, index) => {
-                const progressBar = generateProgressBar(song.total_ms_played, maxMsPlayed);
+                const progressBar = generateProgressBar(song.total_ms_played, maxMsPlayed, user.embed_color);
                 const trackUrl = getSpotifyUrlFromUri(song.spotify_track_uri);
                 const trackNameDisplay = trackUrl
                     ? `[${song.track_name}](${trackUrl})` // Markdown link
                     : song.track_name; // Plain text
 
-                description += `**${index + 1}. ${trackNameDisplay}**\n`; // Use the display name (link or text)
-                description += `- ${song.artist_name}\n`;
-                description += `   ${formatDuration(song.total_ms_played)} (${song.play_count} plays)\n`;
-                if(progressBar) description += `   \`${progressBar}\`\n\n`; else description += `\n`;
+                description += `**${index + 1}. ${trackNameDisplay}** by ${song.artist_name}\n`; // Use the display name (link or text)
+                description += `${formatDuration(song.total_ms_played)} • ${song.play_count} plays\n`;
+                if(progressBar) description += `${progressBar}\n\n`; else description += `\n`;
             });
 
             embed.setDescription(description.trim());
-            embed.setFooter({
-                text: 'Data provided by Spotify',
-                iconURL: SPOTIFY_LOGO_URL
-            });
 
             await interaction.editReply({ embeds: [embed] });
 
         } catch (error) {
             // Log the error including which command failed
-            console.error(`[${interaction.commandName} Error] User ${discordId}, Period ${period}:`, error);
-            await interaction.editReply('An error occurred while fetching your top songs.'); // Keep generic user message
+            console.error(`[${interaction.commandName} Error] User ${targetUserId}, Period ${period}:`, error);
+            await interaction.editReply('An error occurred while fetching the top songs.'); // Keep generic user message
         }
     },
 };

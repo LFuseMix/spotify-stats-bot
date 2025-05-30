@@ -28,11 +28,27 @@ if (missingConfig.length > 0) {
 
 const commands = [];
 const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
+
+// Function to recursively find all .js files in a directory
+function findCommandFiles(directory) {
+    let commandFiles = [];
+    const files = fs.readdirSync(directory, { withFileTypes: true });
+
+    for (const file of files) {
+        const filePath = path.join(directory, file.name);
+        if (file.isDirectory()) {
+            commandFiles = commandFiles.concat(findCommandFiles(filePath));
+        } else if (file.name.endsWith('.js')) {
+            commandFiles.push(filePath);
+        }
+    }
+    return commandFiles;
+}
+
+const commandFiles = findCommandFiles(commandsPath);
 
 console.log('[Deploy] Loading command files...');
-for (const file of commandFiles) {
-	const filePath = path.join(commandsPath, file);
+for (const filePath of commandFiles) { // Iterate over full file paths
 	try {
 		const command = require(filePath);
 		if ('data' in command && typeof command.data.toJSON === 'function') {
@@ -44,7 +60,6 @@ for (const file of commandFiles) {
 	} catch (error) {
 		console.error(`[Deploy Error] Failed to load command at ${filePath}:`, error);
 	}
-
 }
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);

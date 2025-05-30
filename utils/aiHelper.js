@@ -25,15 +25,21 @@ async function generateRoast(userData, periodName) {
     const prompt = `
 ${config.roastPersona}
 
-Here is the user's listening data for the ${periodName} period:
+This user needs a good roasting for their music taste over the ${periodName} period. Here's what they've been listening to:
 Total time listened: ${formatDuration(userData.totalMsListened)}
-Top Artists:
-${userData.topArtists.slice(0, 5).map((a, i) => `${i + 1}. ${a.artist_name} (${formatDuration(a.total_ms_played)})`).join('\n') || 'None listed'}
 
-Top Songs:
-${userData.topSongs.slice(0, 5).map((s, i) => `${i + 1}. ${s.track_name} by ${s.artist_name} (${formatDuration(s.total_ms_played)})`).join('\n') || 'None listed'}
+Their Top Artists:
+${userData.topArtists.slice(0, 5).map((a, i) => `${i + 1}. ${a.artist_name} (listened for ${formatDuration(a.total_ms_played)})`).join('\n') || 'They apparently listen to no artists in particular. Weird.'}
 
-Now, give your sarcastic roast of their music taste based ONLY on this data. Keep it concise for Discord, 2 paragraphs with 4 sentences each going over. Be punchy and act like Hershey the dog. Also throw low blows to any Anitta enjoyers.
+Their Top Songs:
+${userData.topSongs.slice(0, 5).map((s, i) => `${i + 1}. "${s.track_name}" by ${s.artist_name} (listened for ${formatDuration(s.total_ms_played)})`).join('\n') || 'No specific top songs. Are they just listening to elevator music?'}
+
+Now, deliver a sarcastic and funny roast of their music taste based ONLY on this data. Structure it like this:
+1. Start with a general, exaggerated, and humorous summary of their overall taste. What kind of person listens to this?
+2. Comment on their top artists. Are they all the same? A weird mix? Do they only listen to one artist over and over?
+3. Briefly touch on their top songs if there's anything particularly funny or roastable about them.
+
+Keep it punchy and concise, around 2-3 short paragraphs suitable for Discord. Remember, you are Hershey, a witty and sarcastic dog. And, of course, don't forget to throw some shade at Anitta if the opportunity arises – we all know her music is objectively inferior.
 `;
     try {
         const result = await model.generateContent(prompt);

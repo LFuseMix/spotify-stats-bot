@@ -2,6 +2,7 @@
 const Database = require('better-sqlite3');
 const path = require('node:path');
 const fs = require('node:fs');
+const Logger = require('./logger'); // Add our new logger
 
 // Determine the database path (e.g., in the project root)
 const dbPath = path.join(__dirname, '..', 'spotify_stats.db');
@@ -10,25 +11,27 @@ let db;
 function initializeDatabase() {
     // Ensure verbose logging is off unless debugging
     db = new Database(dbPath, { /* verbose: console.log */ });
-    console.log(`[Database] Connected to SQLite database at ${dbPath}`);
+    Logger.database('connect', `Connected to SQLite database`, `Path: ${dbPath}`);
 
     // Enable WAL mode for better concurrency
     try {
         db.pragma('journal_mode = WAL');
-        console.log('[Database] WAL mode set.');
+        Logger.database('config', 'WAL mode set successfully');
     } catch (pragmaError) {
-        console.error('[Database] Failed to set WAL mode:', pragmaError);
+        Logger.error('database', 'Failed to set WAL mode', pragmaError.message);
     }
 
     // --- Create Tables Transaction ---
     try {
-        console.log('[Database] Starting TABLE creation transaction...');
+        Logger.database('init', 'Starting TABLE creation transaction...');
         db.transaction(() => {
             db.prepare(`
                 CREATE TABLE IF NOT EXISTS users (
                     discord_id TEXT PRIMARY KEY, spotify_id TEXT UNIQUE,
                     spotify_access_token TEXT, spotify_refresh_token TEXT,
-                    token_expires_at INTEGER, embed_color TEXT DEFAULT '#1DB954'
+                    token_expires_at INTEGER, embed_color TEXT DEFAULT '#1DB954',
+                    is_admin INTEGER DEFAULT 0, -- Added is_admin column
+                    profile_public INTEGER DEFAULT 0 -- Added privacy setting (0 = private, 1 = public)
                 )
             `).run();
 
@@ -51,15 +54,13 @@ function initializeDatabase() {
                 DROP INDEX IF EXISTS idx_history_unique_play
             `).run();
 
-            // Create a unique index that includes the track URI
-            db.prepare(`
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_history_unique_play 
-                ON history (discord_id, spotify_track_uri, ts)
-            `).run();
+            // The unique index on (discord_id, spotify_track_uri, ts) has been removed
+            // to allow multiple history entries for the same track at the exact same timestamp,
+            // particularly for uploaded histories where granular plays might share a timestamp.
         })();
-        console.log('[Database] TABLE creation transaction committed successfully.');
+        Logger.success('database', 'TABLE creation transaction committed successfully');
     } catch (error) {
-         console.error('[Database] TABLE creation transaction failed:', error);
+         Logger.error('database', 'TABLE creation transaction failed', error.message);
          throw error;
     }
 
@@ -68,13 +69,13 @@ function initializeDatabase() {
          db.prepare(`
             CREATE INDEX IF NOT EXISTS idx_history_discord_ts ON history (discord_id, ts DESC)
          `).run();
-         console.log('[Database] Indices ensured successfully.');
+         Logger.database('index', 'Indices ensured successfully');
     } catch (error) {
-         console.error('[Database] INDEX creation failed:', error);
+         Logger.error('database', 'INDEX creation failed', error.message);
          throw error;
     }
 
-    console.log('[Database] Tables and Indices ensured (End of initializeDatabase).');
+    Logger.success('database', 'Tables and Indices ensured (End of initializeDatabase).');
 } // End of initializeDatabase function
 
 // --- User Functions ---
@@ -110,25 +111,47 @@ function linkSpotifyAccount(discordId, spotifyId, accessToken, refreshToken, exp
             spotify_refresh_token = COALESCE(excluded.spotify_refresh_token, spotify_refresh_token),
             token_expires_at = excluded.token_expires_at
     `);
-    stmt.run(discordId, spotifyId, accessToken, refreshToken, expiresAt);
+    
+    try {
+        stmt.run(discordId, spotifyId, accessToken, refreshToken, expiresAt);
+        return { success: true, message: 'Successfully linked Spotify account' };
+    } catch (error) {
+        Logger.error('database', 'Failed to link Spotify account', error.message);
+        return { success: false, message: 'Database error while linking account' };
+    }
 }
 
 function updateUserTokens(discordId, accessToken, refreshToken, expiresIn) {
     if (!db) throw new Error("Database not initialized yet.");
-    const expiresAt = Math.floor(Date.now() / 1000) + expiresIn;
+    
+    // If clearing tokens (null values), set expiration to 0
+    const expiresAt = (accessToken === null) ? 0 : Math.floor(Date.now() / 1000) + expiresIn;
+    
     const stmt = db.prepare(`
         UPDATE users
         SET spotify_access_token = ?,
-            ${refreshToken ? 'spotify_refresh_token = ?,' : ''}
+            ${refreshToken !== undefined ? 'spotify_refresh_token = ?,' : ''}
             token_expires_at = ?
         WHERE discord_id = ?
     `);
+    
     const params = [accessToken];
-    if (refreshToken) {
+    if (refreshToken !== undefined) {
         params.push(refreshToken);
     }
     params.push(expiresAt, discordId);
-    stmt.run(...params);
+    
+    try {
+        const result = stmt.run(...params);
+        if (result.changes === 0) {
+            Logger.warn('database', `No user found to update tokens for discord_id: ${discordId}`);
+        } else {
+            Logger.database('tokens', `Updated tokens for user ${discordId}`, accessToken ? 'Valid tokens' : 'Cleared tokens');
+        }
+    } catch (error) {
+        Logger.error('database', `Failed to update user tokens for ${discordId}`, error.message);
+        throw error;
+    }
 }
 
 function updateUserColor(discordId, color) {
@@ -136,6 +159,57 @@ function updateUserColor(discordId, color) {
     const stmt = db.prepare('UPDATE users SET embed_color = ? WHERE discord_id = ?');
     const info = stmt.run(color, discordId);
     return info.changes > 0;
+}
+
+// --- Privacy Functions ---
+function updateUserPrivacy(discordId, isPublic) {
+    if (!db) throw new Error("Database not initialized yet.");
+    const stmt = db.prepare('UPDATE users SET profile_public = ? WHERE discord_id = ?');
+    const info = stmt.run(isPublic ? 1 : 0, discordId);
+    return info.changes > 0;
+}
+
+function isUserProfilePublic(discordId) {
+    if (!db) throw new Error("Database not initialized yet.");
+    const stmt = db.prepare('SELECT profile_public FROM users WHERE discord_id = ?');
+    const user = stmt.get(discordId);
+    return user ? user.profile_public === 1 : false;
+}
+
+function getUserByDiscordId(discordId) {
+    if (!db) throw new Error("Database not initialized yet.");
+    const stmt = db.prepare('SELECT * FROM users WHERE discord_id = ?');
+    return stmt.get(discordId);
+}
+
+// --- Admin Check Function ---
+function isAdmin(discordId) {
+    if (!db) throw new Error("Database not initialized yet.");
+
+    // Load config to check superAdminId
+    const configPath = path.join(__dirname, '..', 'config.json');
+    let config = {};
+    try {
+        if (fs.existsSync(configPath)) {
+            config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+        } else {
+            Logger.error('isAdmin', 'config.json not found!');
+            // Depending on how critical this is, you might want to throw an error
+            // or return false, assuming no super admin if config is missing.
+            return false; 
+        }
+    } catch (error) {
+        Logger.error('isAdmin', 'Error reading or parsing config.json', error.message);
+        return false; // Safer to deny admin rights on config error
+    }
+
+    if (config.superAdminId && discordId === config.superAdminId) {
+        return true; // User is the super admin
+    }
+
+    const stmt = db.prepare('SELECT is_admin FROM users WHERE discord_id = ?');
+    const user = stmt.get(discordId);
+    return user ? user.is_admin === 1 : false;
 }
 
 // --- History Functions ---
@@ -147,156 +221,70 @@ function addHistoryEntries(discordId, entries, source) {
     let added = 0;
     let skipped = 0;
     let invalidEntries = 0;
+    let loggedSkipCount = 0;
+    const MAX_SKIP_LOGS = 5; // Only log first 5 duplicates
+    const addedTracks = []; // Track which tracks were actually added
 
     const insertMany = db.transaction((entries) => {
         for (const entry of entries) {
-            const timestamp = entry.ts;
+            const timestamp = entry.ts; // This is now a Unix timestamp in seconds
             const msPlayed = entry.ms_played;
             const trackName = entry.master_metadata_track_name || entry.track_name || 'Unknown Track';
             const artistName = entry.master_metadata_album_artist_name || entry.artist_name || 'Unknown Artist';
             const albumName = entry.master_metadata_album_name || entry.album_name || null;
             const trackUri = entry.spotify_track_uri;
 
-            // Validate required fields
-            if (!trackName || !artistName || !trackUri) {
-                console.log(`[Database] Skipping entry for ${discordId}: Missing required fields (track: ${trackName}, artist: ${artistName}, uri: ${trackUri})`);
+            if (!trackName || !artistName || !trackUri || typeof timestamp !== 'number' || isNaN(timestamp)) {
+                Logger.warn('database', `Skipping entry due to missing/invalid fields`, `User: ${discordId}, Track: '${trackName}', Artist: '${artistName}', URI: '${trackUri}', TS: ${timestamp}`);
                 invalidEntries++;
                 continue;
             }
 
-            // --- NEW LOGIC: For 'recent', always insert as new row ---
             if (source === 'recent') {
-                try {
-                    const date = new Date(timestamp);
-                    if (isNaN(date.getTime())) {
-                        console.log(`[Database] Invalid timestamp for ${discordId}: ${timestamp}`);
-                        invalidEntries++;
-                        continue;
+                // For 'recent' source, check if this exact play (user, track, timestamp) already exists
+                const existingPlay = db.prepare(
+                    'SELECT id FROM history WHERE discord_id = ? AND spotify_track_uri = ? AND ts = ?'
+                ).get(discordId, trackUri, timestamp);
+
+                if (existingPlay) {
+                    // Only log the first few duplicate entries, then show a summary
+                    if (loggedSkipCount < MAX_SKIP_LOGS) {
+                        // We'll track this for summary instead of individual logging
+                        loggedSkipCount++;
                     }
-                } catch (e) {
-                    console.log(`[Database] Error processing timestamp for ${discordId}: ${timestamp}, Error: ${e.message}`);
-                    invalidEntries++;
+                    skipped++;
                     continue;
                 }
-                try {
-                    db.prepare(`
-                        INSERT INTO history (
-                            discord_id, ts, ms_played, track_name, artist_name, album_name, spotify_track_uri, source
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    `).run(
-                        discordId,
-                        timestamp,
-                        msPlayed,
-                        trackName,
-                        artistName,
-                        albumName,
-                        trackUri,
-                        source
-                    );
-                    added++;
-                } catch (e) {
-                    // If there's a unique constraint error, skip (shouldn't happen with unique ts)
-                    skipped++;
-                }
-                continue;
-            }
-            // --- END NEW LOGIC ---
-
-            // --- Existing deduplication logic for uploads ---
-            // Check if this song was recently played (within its duration + 60 seconds buffer)
-            const recentPlayCheck = db.prepare(`
-                SELECT ts, ms_played 
-                FROM history 
-                WHERE discord_id = ? 
-                AND spotify_track_uri = ? 
-                AND ts > ? - (ms_played / 1000 + 60)  -- Check within song duration + 60 seconds
-                ORDER BY ts DESC 
-                LIMIT 1
-            `).get(discordId, trackUri, timestamp);
-
-            if (recentPlayCheck) {
-                // If this is a recent play, update the existing entry instead of creating a new one
-                const result = db.prepare(`
-                    UPDATE history 
-                    SET ms_played = ms_played + ?,
-                        source = CASE 
-                            WHEN source = 'upload' THEN 'upload'
-                            ELSE ?
-                        END
-                    WHERE discord_id = ? 
-                    AND spotify_track_uri = ? 
-                    AND ts = ?
-                `).run(
-                    msPlayed,
-                    source,
-                    discordId,
-                    trackUri,
-                    recentPlayCheck.ts
-                );
-
-                if (result.changes > 0) {
-                    console.log(`[Database] Updated recent play for ${discordId}: ${trackName} by ${artistName} (URI: ${trackUri})`);
-                    skipped++;
-                }
-                continue;
             }
 
-            // Validate timestamp before processing
+            // For 'upload' source OR if it's a 'recent' play not found above, insert as a new row.
             try {
-                const date = new Date(timestamp);
-                if (isNaN(date.getTime())) {
-                    console.log(`[Database] Invalid timestamp for ${discordId}: ${timestamp}`);
-                    invalidEntries++;
-                    continue;
-                }
-            } catch (e) {
-                console.log(`[Database] Error processing timestamp for ${discordId}: ${timestamp}, Error: ${e.message}`);
-                invalidEntries++;
-                continue;
-            }
-
-            const result = db.prepare(`
-                INSERT INTO history (
-                    discord_id, ts, ms_played, track_name, artist_name, album_name, spotify_track_uri, source
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(discord_id, spotify_track_uri, ts) DO UPDATE SET
-                    ms_played = CASE 
-                        WHEN excluded.source = 'recent' AND history.source = 'recent' THEN history.ms_played
-                        WHEN excluded.source = 'recent' THEN history.ms_played
-                        WHEN history.source = 'recent' THEN excluded.ms_played
-                        ELSE history.ms_played + excluded.ms_played
-                    END,
-                    source = CASE 
-                        WHEN excluded.source = 'upload' THEN 'upload'
-                        ELSE history.source
-                    END
-            `).run(
-                discordId,
-                timestamp,
-                msPlayed,
-                trackName,
-                artistName,
-                albumName,
-                trackUri,
-                source
-            );
-
-            if (result.changes > 0) {
+                db.prepare(`
+                    INSERT INTO history (
+                        discord_id, ts, ms_played, track_name, artist_name, album_name, spotify_track_uri, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `).run(
+                    discordId,
+                    timestamp,
+                    msPlayed,
+                    trackName,
+                    artistName,
+                    albumName,
+                    trackUri,
+                    source
+                );
                 added++;
-            } else {
-                // Handle both recent tracks and uploaded history data structures
-                const trackName = entry.track_name || entry.master_metadata_track_name;
-                const artistName = entry.artist_name || entry.master_metadata_album_artist_name;
                 
-                // Convert timestamp to milliseconds if it's in seconds (less than 1e12)
-                const timestampMs = timestamp < 1e12 ? timestamp * 1000 : timestamp;
-                try {
-                    const dateStr = new Date(timestampMs).toISOString();
-                    console.log(`[Database] Updated existing entry for ${discordId}: ${trackName || 'Unknown Track'} by ${artistName || 'Unknown Artist'} at ${dateStr} (URI: ${entry.spotify_track_uri || 'No URI'})`);
-                } catch (e) {
-                    console.log(`[Database] Updated existing entry for ${discordId}: ${trackName || 'Unknown Track'} by ${artistName || 'Unknown Artist'} (invalid timestamp: ${timestamp}, URI: ${entry.spotify_track_uri || 'No URI'})`);
-                }
-                skipped++;
+                // Store details of the added track
+                addedTracks.push({
+                    trackName,
+                    artistName,
+                    timestamp,
+                    discordId
+                });
+            } catch (e) {
+                Logger.error('database', `Error inserting entry`, `User: ${discordId}, Track: ${trackName}, URI: ${trackUri}, TS: ${timestamp}, Error: ${e.message}`);
+                invalidEntries++;
             }
         }
     });
@@ -304,38 +292,58 @@ function addHistoryEntries(discordId, entries, source) {
     try {
         insertMany(entries);
     } catch (error) {
-        console.error(`[Database Error] Transaction failed during addHistoryEntries for ${discordId} (Source: ${source}):`, error);
+        Logger.error('database', `Transaction failed during addHistoryEntries`, `User: ${discordId}, Source: ${source}, Error: ${error.message}`);
         throw error;
     }
 
+    // Show summary with indication if there were more skipped entries beyond what we logged
     if (added > 0 || skipped > 0 || invalidEntries > 0) {
-        console.log(`[Database] User ${discordId}: Added ${added}, Skipped ${skipped}, Invalid ${invalidEntries} history entries. Source: ${source}.`);
+        let stats = `Added: ${added}, Skipped: ${skipped}, Invalid: ${invalidEntries}`;
+        if (source === 'recent' && skipped > 0) {
+            // Use a more condensed tracker summary for recent duplicates
+            Logger.tracker('duplicate_summary', `User ${discordId} recent tracks processed`, stats);
+        } else {
+            Logger.database('processed', `User ${discordId} entries processed from ${source}`, stats);
+        }
     }
-    return { added, skipped, invalidEntries };
+    return { added, skipped, invalidEntries, addedTracks };
 }
 
 // --- Stats Query Functions ---
 
 function getTopSongs(discordId, limit, startTime, endTime) {
     if (!db) throw new Error("Database not initialized yet.");
+
+    Logger.database('debug', `[Debug DB getTopSongs] Params: discordId=${discordId}, limit=${limit}, startTime=${startTime}, endTime=${endTime}`);
+
+    // Modified SQL: Removed ORDER BY and LIMIT
     const stmt = db.prepare(`
         SELECT
             track_name,
             artist_name,
             spotify_track_uri,
-            SUM(CASE 
-                WHEN source = 'recent' THEN 180000 -- Assume 3 minutes for recent plays
-                ELSE ms_played 
-            END) as total_ms_played,
+            SUM(ms_played) as total_ms_played,
             COUNT(*) as play_count
         FROM history
         WHERE discord_id = ? AND ts >= ? AND ts < ? 
-        AND (ms_played > 3000 OR source = 'recent')
+        AND ms_played > 3000
         GROUP BY track_name, artist_name, spotify_track_uri
-        ORDER BY total_ms_played DESC
-        LIMIT ?
     `);
-    return stmt.all(discordId, startTime, endTime, limit);
+    
+    // Fetch all grouped results
+    let allGroupedSongs = stmt.all(discordId, startTime, endTime);
+    
+    Logger.database('debug', `[Debug DB getTopSongs] Raw result from stmt.all() before JS sort (count: ${allGroupedSongs.length}):`, JSON.stringify(allGroupedSongs.slice(0, 20), null, 2)); // Log first 20 for brevity
+
+    // Sort in JavaScript
+    allGroupedSongs.sort((a, b) => b.total_ms_played - a.total_ms_played);
+
+    // Slice to the limit
+    const result = allGroupedSongs.slice(0, limit);
+    
+    Logger.database('debug', `[Debug DB getTopSongs] Result after JS sort and slice (count: ${result.length}):`, JSON.stringify(result, null, 2));
+
+    return result;
 }
 
 function getTopArtists(discordId, limit, startTime, endTime) {
@@ -343,15 +351,12 @@ function getTopArtists(discordId, limit, startTime, endTime) {
     const stmt = db.prepare(`
         SELECT
             artist_name,
-            SUM(CASE 
-                WHEN source = 'recent' THEN 180000 -- Assume 3 minutes for recent plays
-                ELSE ms_played 
-            END) as total_ms_played,
+            SUM(ms_played) as total_ms_played,
             COUNT(DISTINCT track_name) as unique_tracks,
             COUNT(*) as total_plays
         FROM history
         WHERE discord_id = ? AND ts >= ? AND ts < ? 
-        AND (ms_played > 3000 OR source = 'recent')
+        AND ms_played > 3000
         AND artist_name IS NOT NULL AND artist_name != ''
         GROUP BY artist_name
         ORDER BY total_ms_played DESC
@@ -360,15 +365,17 @@ function getTopArtists(discordId, limit, startTime, endTime) {
     return stmt.all(discordId, startTime, endTime, limit);
 }
 
-function getTopGenresPlaceholder(discordId, limit, startTime, endTime) {
+function getTopGenres(discordId, limit, startTime, endTime) {
      if (!db) throw new Error("Database not initialized yet.");
-    console.warn("[DB Get Top Genres Placeholder] Genre data is not directly available in history. This function provides a basic artist aggregation as a placeholder.");
+    Logger.warn('database', "[DB Get Top Genres] Genre data is fetched live by the /top-genres command by querying artists. This DB function is a placeholder for artist aggregation if direct genre data were stored.");
     const stmt = db.prepare(`
         SELECT
             artist_name as genre_placeholder,
             SUM(ms_played) as total_ms_played
         FROM history
-        WHERE discord_id = ? AND ts >= ? AND ts < ? AND ms_played > 3000 AND artist_name IS NOT NULL AND artist_name != ''
+        WHERE discord_id = ? AND ts >= ? AND ts < ? 
+        AND ms_played > 3000
+        AND artist_name IS NOT NULL AND artist_name != ''
         GROUP BY artist_name
         ORDER BY total_ms_played DESC
         LIMIT ?
@@ -381,15 +388,12 @@ function getAllUserDataForPeriod(discordId, startTime, endTime) {
     const topSongs = getTopSongs(discordId, 20, startTime, endTime);
     const topArtists = getTopArtists(discordId, 10, startTime, endTime);
     
-    // Modified total time calculation to include recent plays
+    // Modified total time calculation to include recent plays and all uploaded history
     const totalTimeStmt = db.prepare(`
-        SELECT SUM(CASE 
-            WHEN source = 'recent' THEN 180000 -- Assume 3 minutes for recent plays
-            ELSE ms_played 
-        END) as total_ms 
+        SELECT SUM(ms_played) as total_ms 
         FROM history 
         WHERE discord_id = ? AND ts >= ? AND ts < ? 
-        AND (ms_played > 3000 OR source = 'recent')
+        AND ms_played > 3000
     `);
     const totalTimeResult = totalTimeStmt.get(discordId, startTime, endTime);
 
@@ -400,6 +404,55 @@ function getAllUserDataForPeriod(discordId, startTime, endTime) {
     };
 }
 
+// Function to get total stats for a period
+function getTotalStatsForPeriod(discordId, startTime, endTime) {
+    if (!db) throw new Error("Database not initialized yet.");
+    
+    const stmt = db.prepare(`
+        SELECT 
+            SUM(ms_played) as total_ms_played,
+            COUNT(*) as total_play_count
+        FROM history 
+        WHERE discord_id = ? AND ts >= ? AND ts < ? 
+        AND ms_played > 3000
+    `);
+    
+    const result = stmt.get(discordId, startTime, endTime);
+    return {
+        totalMsPlayed: result?.total_ms_played || 0,
+        totalPlayCount: result?.total_play_count || 0
+    };
+}
+
+// --- Data Clearing Function ---
+function clearUserData(targetDiscordId) {
+    if (!db) throw new Error("Database not initialized yet.");
+
+    try {
+        // Using a transaction to ensure atomicity
+        db.transaction(() => {
+            // Delete from history table
+            const historyDeleteStmt = db.prepare('DELETE FROM history WHERE discord_id = ?');
+            const historyResult = historyDeleteStmt.run(targetDiscordId);
+            Logger.database('delete', `Deleted ${historyResult.changes} entries from history`, `User: ${targetDiscordId}`);
+
+            // Delete from users table
+            const userDeleteStmt = db.prepare('DELETE FROM users WHERE discord_id = ?');
+            const userResult = userDeleteStmt.run(targetDiscordId);
+            Logger.database('delete', `Deleted ${userResult.changes} entry from users`, `User: ${targetDiscordId}`);
+        })();
+        return { success: true, message: `Successfully cleared data for user ${targetDiscordId}.` };
+    } catch (error) {
+        Logger.error('database', `Error clearing data for user ${targetDiscordId}`, error.message);
+        return { success: false, message: `Failed to clear data for user ${targetDiscordId}. Check logs.` };
+    }
+}
+
+// Function to get the database instance (used by commands)
+function getDbInstance() {
+    return db;
+}
+
 module.exports = {
     initializeDatabase,
     getUser,
@@ -408,10 +461,17 @@ module.exports = {
     linkSpotifyAccount,
     updateUserTokens,
     updateUserColor,
+    updateUserPrivacy,
+    isUserProfilePublic,
+    getUserByDiscordId,
+    isAdmin,
     addHistoryEntries,
     getTopSongs,
     getTopArtists,
-    getTopGenresPlaceholder,
+    getTopGenres,
     getAllUserDataForPeriod,
+    getTotalStatsForPeriod,
+    clearUserData,
+    getDbInstance,
     getDbInstance: () => db
 };

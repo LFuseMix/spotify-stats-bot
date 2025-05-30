@@ -1,6 +1,6 @@
 // commands/top_genres.js
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
-const { getUser, getTopArtists } = require('../utils/database'); // Get top artists to know who to query genres for
+const { getUser, getTopArtists, getTotalStatsForPeriod, isUserProfilePublic, getUserByDiscordId } = require('../utils/database'); // Get top artists to know who to query genres for
 const { getUserSpotifyApi } = require('../utils/spotify'); // To get user's API client
 const { getTimestampsForPeriod, formatDuration } = require('../utils/dateUtils');
 const { generateProgressBar } = require('../utils/progressBar');
@@ -42,15 +42,47 @@ module.exports = {
                     { name: 'Last 6 Months', value: '6m' },
                     { name: 'Last Year', value: '1y' },
                     { name: 'All Time', value: 'all' }
-                )),
+                ))
+        .addUserOption(option =>
+            option.setName('user')
+                .setDescription('View another user\'s top genres (they must have public profile).')
+                .setRequired(false)
+        ),
     async execute(interaction) {
-        const discordId = interaction.user.id;
+        const requestingUserId = interaction.user.id;
+        const targetUser = interaction.options.getUser('user');
+        const targetUserId = targetUser ? targetUser.id : requestingUserId;
         const limit = interaction.options.getInteger('top');
         const period = interaction.options.getString('period');
 
-        const user = getUser(discordId);
-        if (!user || !user.spotify_id) {
+        // Check if viewing another user's stats
+        const isViewingOtherUser = targetUserId !== requestingUserId;
+
+        // Get requesting user info (for embed color, etc.)
+        const requestingUser = getUser(requestingUserId);
+        if (!requestingUser || !requestingUser.spotify_id) {
             return interaction.reply({ content: 'You need to connect your Spotify account first using `/connect` for genre information.', ephemeral: true });
+        }
+
+        // Get target user info
+        const user = getUserByDiscordId(targetUserId);
+        if (!user || !user.spotify_id) {
+            if (isViewingOtherUser) {
+                return interaction.reply({ content: `${targetUser.username} hasn't connected their Spotify account yet.`, ephemeral: true });
+            } else {
+                return interaction.reply({ content: 'You need to connect your Spotify account first using `/connect` for genre information.', ephemeral: true });
+            }
+        }
+
+        // Privacy check for viewing other users
+        if (isViewingOtherUser) {
+            const isPublic = isUserProfilePublic(targetUserId);
+            if (!isPublic) {
+                return interaction.reply({ 
+                    content: `${targetUser.username}'s profile is private. They need to use \`/privacy setting:public\` to allow others to view their stats.`, 
+                    ephemeral: true 
+                });
+            }
         }
 
         await interaction.deferReply();
@@ -58,14 +90,18 @@ module.exports = {
         try {
             const { startTime, endTime, periodName } = getTimestampsForPeriod(period);
 
-            // 1. Get Top Artists from DB
-            const topArtistsData = getTopArtists(discordId, 50, startTime, endTime);
+            // 1. Get Top Artists from DB for the target user
+            const topArtistsData = getTopArtists(targetUserId, 50, startTime, endTime);
             if (!topArtistsData || topArtistsData.length === 0) {
-                return interaction.editReply(`Couldn't find any listening history for you in the ${periodName} period to determine genres.`);
+                const userName = isViewingOtherUser ? targetUser.username : 'you';
+                return interaction.editReply(`Couldn't find any listening history for ${userName} in the ${periodName} period to determine genres.`);
             }
+            
+            // Get total stats for the period
+            const totalStats = getTotalStatsForPeriod(targetUserId, startTime, endTime);
 
-            // 2. Get Authenticated Spotify API Client
-            const spotifyApi = await getUserSpotifyApi(discordId);
+            // 2. Get Authenticated Spotify API Client (always use requesting user's API for Spotify calls)
+            const spotifyApi = await getUserSpotifyApi(requestingUserId);
             if (!spotifyApi) {
                  return interaction.editReply({ content: 'Could not refresh your Spotify connection. Please try `/connect` again.', ephemeral: true });
             }
@@ -85,7 +121,7 @@ module.exports = {
             );
             await Promise.all(searchPromises);
             if (artistIds.length === 0) {
-                 return interaction.editReply(`Found artists in your history, but couldn't match them to Spotify artists to get genres.`);
+                 return interaction.editReply(`Found artists in the history, but couldn't match them to Spotify artists to get genres.`);
             }
 
             // 4. Fetch Artist Details (including Genres)
@@ -127,20 +163,26 @@ module.exports = {
                 .sort(([, timeA], [, timeB]) => timeB - timeA)
                 .slice(0, limit);
 
+            const displayName = isViewingOtherUser ? targetUser.username : interaction.user.username;
             const embed = new EmbedBuilder()
                 .setColor(user.embed_color || config.defaultEmbedColor)
-                .setTitle(`🎶 ${interaction.user.username}'s Top ${sortedGenres.length} Genres (${periodName})`);
+                .setTitle(`🎶 ${displayName}'s Top ${sortedGenres.length} Genres (${periodName})`)
+                .addFields({
+                    name: '📊 Total Period Activity',
+                    value: `**Total Listening Time:** ${formatDuration(totalStats.totalMsPlayed)}\n**All Songs Played:** ${totalStats.totalPlayCount.toLocaleString()} plays`,
+                    inline: false
+                });
 
             let description = '';
             const maxMsPlayed = sortedGenres[0]?.[1] || 1;
 
             sortedGenres.forEach(([genre, totalMsPlayed], index) => {
-                const progressBar = generateProgressBar(totalMsPlayed, maxMsPlayed);
+                const progressBar = generateProgressBar(totalMsPlayed, maxMsPlayed, user.embed_color);
                  const displayGenre = genre.split(' ').map(word => word.charAt(0).toUpperCase() + word.slice(1)).join(' ');
                 // No linking needed for genres
                 description += `**${index + 1}. ${displayGenre}**\n`;
-                description += `   ${formatDuration(totalMsPlayed)}\n`;
-                if(progressBar) description += `   \`${progressBar}\`\n\n`; else description += `\n`;
+                description += `${formatDuration(totalMsPlayed)}\n`;
+                if(progressBar) description += `${progressBar}\n\n`; else description += `\n`;
             });
 
              if(sortedGenres.length < limit && Object.keys(genrePlaytime).length > sortedGenres.length) {
@@ -149,18 +191,24 @@ module.exports = {
 
             embed.setDescription(description.trim());
 
-            // *** MODIFIED: Add footer attribution ***
-            // Note: Keep original footer text about source if desired, or replace/combine
-            embed.setFooter({
-                 text: 'Genre data based on artist plays. Data provided by Spotify.', // Combine texts
-                 iconURL: SPOTIFY_LOGO_URL
-            });
+            // Add appropriate footer based on viewing mode
+            if (isViewingOtherUser) {
+                embed.setFooter({
+                    text: `${targetUser.username} has a public profile • Genre data based on artist plays • Data provided by Spotify`,
+                    iconURL: SPOTIFY_LOGO_URL
+                });
+            } else {
+                embed.setFooter({
+                    text: 'Genre data based on artist plays. Data provided by Spotify.',
+                    iconURL: SPOTIFY_LOGO_URL
+                });
+            }
 
             await interaction.editReply({ embeds: [embed] });
 
         } catch (error) {
-            console.error(`[Top Genres Error] User ${discordId}, Period ${period}:`, error);
-             let errorMsg = 'An error occurred while fetching your top genres.';
+            console.error(`[Top Genres Error] User ${targetUserId}, Period ${period}:`, error);
+             let errorMsg = 'An error occurred while fetching the top genres.';
              if (error?.body?.error?.message) { errorMsg += `\n*Spotify API Error: ${error.body.error.message}*`; }
              else if (error?.message?.includes('refresh token')) { errorMsg = 'Could not refresh your Spotify connection. Please try `/connect` again.'; }
             await interaction.editReply(errorMsg);
